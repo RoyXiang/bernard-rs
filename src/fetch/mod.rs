@@ -5,10 +5,17 @@ use chrono::Duration;
 use reqwest::{Client, ClientBuilder, IntoUrl, StatusCode};
 use serde::de::Deserializer;
 use serde::Deserialize;
-use snafu::{Backtrace, ResultExt, Snafu};
+use snafu::{Backtrace, IntoError, Snafu};
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use tap::prelude::*;
 use tracing::{error, trace, warn, Instrument};
+
+/// Limit for establishing a connection, including DNS, TCP, and TLS.
+const CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+
+/// Limit for one HTTP call, from connect until the response body has finished.
+const REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 mod auth;
 mod changes;
@@ -24,6 +31,8 @@ pub enum Error {
     DriveNotFound { backtrace: Backtrace },
     #[snafu(display("Unable to connect to the Google Drive API"))]
     Connection { source: reqwest::Error },
+    #[snafu(display("Network request timed out after {} seconds", seconds))]
+    Timeout { seconds: u64, backtrace: Backtrace },
     #[snafu(display("Unable to parse/deserialise the JSON response"))]
     Deserialisation { source: reqwest::Error },
     #[snafu(display("Invalid Service Account Credentials"))]
@@ -38,9 +47,39 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 fn to_backoff_error(error: Error) -> backoff::Error<Error> {
     match error {
-        Error::Connection { .. } | Error::Server { .. } => backoff::Error::Transient(error),
+        Error::Connection { .. } | Error::Server { .. } | Error::Timeout { .. } => {
+            backoff::Error::Transient(error)
+        }
         _ => backoff::Error::Permanent(error),
     }
+}
+
+fn request_error(error: reqwest::Error) -> Error {
+    if error.is_timeout() {
+        timeout_error(&error)
+    } else {
+        Connection.into_error(error)
+    }
+}
+
+fn body_error(error: reqwest::Error) -> Error {
+    if error.is_timeout() {
+        timeout_error(&error)
+    } else {
+        Deserialisation.into_error(error)
+    }
+}
+
+fn timeout_error(error: &reqwest::Error) -> Error {
+    // A connect timeout is also reported as a timeout. It fires first, at the
+    // shorter connect limit, while the request is still being established.
+    let seconds = if error.is_connect() {
+        CONNECT_TIMEOUT.as_secs()
+    } else {
+        REQUEST_TIMEOUT.as_secs()
+    };
+
+    Timeout { seconds }.build()
 }
 
 pub struct Fetcher {
@@ -86,11 +125,11 @@ impl Fetcher {
     {
         trace!(url_path = %request.url().path(), "making request");
 
-        let response = self.client.execute(request).await.context(Connection)?;
+        let response = self.client.execute(request).await.map_err(request_error)?;
 
         let status = response.status();
         if status.is_success() {
-            let response: T = response.json().await.context(Deserialisation)?;
+            let response: T = response.json().await.map_err(body_error)?;
             return Ok(response);
         }
 
@@ -155,7 +194,9 @@ pub struct FetchBuilder {
 impl FetchBuilder {
     pub fn new(account: Account) -> Self {
         Self {
-            client: ClientBuilder::new(),
+            client: ClientBuilder::new()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT),
             account,
         }
     }
